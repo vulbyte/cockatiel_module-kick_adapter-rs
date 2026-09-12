@@ -1,0 +1,12 @@
+{
+    "name": "kick-adapter", 
+    "description": "a module to interface with kick.com",
+    "version": "0.1.0", 
+    "capabilities": "input",    
+    "root_file": "./src/main.rs",
+    "launch_command": "cargo run",
+    "command_flags": [
+        " --release"
+    ],
+    "autostart": true
+}
