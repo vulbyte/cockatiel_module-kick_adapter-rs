@@ -1,12 +1,8 @@
 {
-  "engine_port": 9734,
-  "module_specific": {
-    "channel_name": "vulbyte",
-    "client_id": "01M1QA9E8SETJN3JED21M4J51Z",
-    "client_secret": "975cb1309008b2bfac41e0f7e4dc36329dff194c1d6e4d5a868293f58b4a9b00",
-    "oauth_token": "NDHMMTUYZJUTMDCWYI0ZYZI1LWE1Y2YTOGMZZWJJOWQXZME0"
-  },
-  "pairing_pin": 957,
-  "priority": 10,
-  "process_position": "input"
+  "ip": "127.0.0.1",
+  "port": 9734,
+  "pin": 603936,
+  "module_name": "kick-adapter",
+  "position": 1,
+  "priority": 100
 }

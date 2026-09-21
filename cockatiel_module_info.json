@@ -1,12 +1,65 @@
 {
-    "name": "kick-adapter", 
-    "description": "a module to interface with kick.com",
-    "version": "0.1.0", 
-    "capabilities": "input",    
-    "root_file": "./src/main.rs",
-    "launch_command": "cargo run",
-    "command_flags": [
-        " --release"
-    ],
-    "autostart": true
+  "name": "kick-adapter",
+  "description": "a module to interface with kick.com",
+  "version": "0.1.0",
+  "capabilities": "input",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": [
+    "--release"
+  ],
+  "autostart": true,
+  "credentials": [
+    {
+      "key": "channel_name",
+      "label": "Channel",
+      "sensitive": false,
+      "list": false,
+      "env": ""
+    },
+    {
+      "key": "client_id",
+      "label": "Client ID (kick.com/settings/developer)",
+      "sensitive": true,
+      "list": false,
+      "env": "KICK_CLIENT_ID"
+    },
+    {
+      "key": "client_secret",
+      "label": "Client Secret",
+      "sensitive": true,
+      "list": false,
+      "env": "KICK_CLIENT_SECRET"
+    },
+    {
+      "key": "oauth_token",
+      "label": "OAuth Token (auto-acquired)",
+      "sensitive": true,
+      "list": false,
+      "optional": true,
+      "env": "KICK_OAUTH_TOKEN"
+    }
+  ],
+  "binary": {
+    "macos": {
+      "x86_64": "target/release/kick-adapter-rs",
+      "aarch64": "target/release/kick-adapter-rs",
+      "arm": "target/release/kick-adapter-rs"
+    },
+    "linux": {
+      "x86_64": "target/release/kick-adapter-rs",
+      "aarch64": "target/release/kick-adapter-rs",
+      "arm": "target/release/kick-adapter-rs"
+    },
+    "windows": {
+      "x86_64": "target/release/kick-adapter-rs.exe",
+      "aarch64": "target/release/kick-adapter-rs.exe",
+      "arm": "target/release/kick-adapter-rs.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ]
 }
