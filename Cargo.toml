@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cockatiel-client = { path = "../../cockatiel_engine-rs/cockatiel_lib/rust" }
+cockatiel-client = { git = "https://github.com/vulbyte/cockatiel_client-rs", rev = "a37fe0e2ba5fad13b417cfdbbf067a95b3844249" }
 tokio = { version = "1.38", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
