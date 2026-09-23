@@ -760,3 +760,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ban_parses_target_and_reason() {
+        let (qid, p) = parse_mod_command("!ban @user being awful", "mod").unwrap();
+        assert_eq!(qid, "mod_ban");
+        assert_eq!(p["handle"], "user");
+        assert_eq!(p["reason"], "being awful");
+        assert_eq!(p["actor"]["handle"], "mod");
+    }
+
+    #[test]
+    fn timeout_parses_duration_and_reason() {
+        let (qid, p) = parse_mod_command("!timeout @user 600 spamming", "mod").unwrap();
+        assert_eq!(qid, "mod_timeout");
+        assert_eq!(p["duration_secs"], 600);
+        assert_eq!(p["reason"], "spamming");
+    }
+
+    #[test]
+    fn plain_message_is_none() {
+        assert!(parse_mod_command("just chatting", "mod").is_none());
+    }
+}
