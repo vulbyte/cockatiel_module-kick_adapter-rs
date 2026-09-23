@@ -356,6 +356,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let instance_uuid = cockatiel.instance_uuid7.clone();
     let module_name = cockatiel.config.module_name.clone();
 
+    // Register the mod commands with the engine command system: the engine now
+    // parses `!ban` / `!timeout` and routes them back with the parsed Command.
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let commands = Container {
+            version: 1,
+            auth_token: auth_token.clone(),
+            module_name: module_name.clone(),
+            module_instance_uuid7: instance_uuid.clone(),
+            payload: Some(Payload::CommandsPayload(Commands {
+                commands: vec![
+                    Command {
+                        command_name: "ban".to_string(),
+                        command_flag: "!".to_string(),
+                        command_description: "ban a user".to_string(),
+                        command_flags: vec![],
+                    },
+                    Command {
+                        command_name: "timeout".to_string(),
+                        command_flag: "!".to_string(),
+                        command_description: "timeout a user".to_string(),
+                        command_flags: vec![],
+                    },
+                ],
+                alert_on_unknown_command: false,
+            })),
+        };
+        let mut cbuf = Vec::new();
+        use prost::Message;
+        if commands.encode(&mut cbuf).is_ok() {
+            let mut w = write_ws_cockatiel.lock().await;
+            let _ = w.send(WsMessage::Binary(cbuf.into())).await;
+        }
+        info!("registered !ban / !timeout commands");
+    }
+
     // Channel carrying PromptResponses from the engine to the configure loop,
     // so `prompt_for_input` can await the operator's typed answer.
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
@@ -405,6 +441,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else if let Some(Payload::PromptResponse(resp)) = container.payload {
                             // Forward operator answers to the awaiting prompt.
                             let _ = prompt_tx_task.send(resp);
+                        }
+                        // Routed chat command: the engine parsed `!ban` / `!timeout`
+                        // and delivered it here with the parsed Command attached.
+                        else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
+                            let Some(chat) = pre.raw_message else { continue };
+                            let Some(cmd) = chat.command else { continue };
+                            if cmd.command_name != "ban" && cmd.command_name != "timeout" {
+                                continue;
+                            }
+                            let author = chat
+                                .user_data
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or_default();
+                            if let Some((qid, payload)) = parse_mod_command(&chat.raw_message, &author) {
+                                let query = Container {
+                                    version: 1,
+                                    auth_token: auth_task.clone(),
+                                    module_name: module_task.clone(),
+                                    module_instance_uuid7: instance_task.clone(),
+                                    payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                        query_id: qid,
+                                        sql: payload.to_string(),
+                                        params: vec![],
+                                    })),
+                                };
+                                let mut qbuf = Vec::new();
+                                if query.encode(&mut qbuf).is_ok() {
+                                    let mut w = write_task.lock().await;
+                                    let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                }
+                            }
                         }
                     }
                 }
@@ -706,28 +774,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                                 if container.encode(&mut buf).is_ok() {
                                                     if let Err(e) = write_ws_cockatiel.lock().await.send(WsMessage::Binary(buf.into())).await {
                                                         error!("Failed to send message to engine: {}", e);
-                                                    }
-                                                }
-
-                                                // Handle moderator commands (!ban / !timeout).
-                                                if let Some((qid, payload)) = parse_mod_command(content, sender) {
-                                                    info!("Mod command detected: {} payload={}", qid, payload);
-                                                    let query = Container {
-                                                        version: 1,
-                                                        auth_token: auth_token.clone(),
-                                                        module_name: module_name.clone(),
-                                                        module_instance_uuid7: instance_uuid.clone(),
-                                                        payload: Some(Payload::DatabaseQuery(DatabaseQuery {
-                                                            query_id: qid,
-                                                            sql: payload.to_string(),
-                                                            params: vec![],
-                                                        })),
-                                                    };
-                                                    let mut qbuf = Vec::new();
-                                                    if query.encode(&mut qbuf).is_ok() {
-                                                        if let Err(e) = write_ws_cockatiel.lock().await.send(WsMessage::Binary(qbuf.into())).await {
-                                                            error!("Failed to send mod command to engine: {}", e);
-                                                        }
                                                     }
                                                 }
                                             }
