@@ -11,7 +11,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, protocol::Message as WsMessage},
 };
-use tracing::{error, info, Level};
+use tracing::{error, info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 type WsWriteHalf = futures_util::stream::SplitSink<
@@ -139,6 +139,67 @@ fn save_adapter_config(
         ],
     );
     info!("Successfully saved Kick configuration (channel → config.json, secrets → .env)");
+}
+
+/// The operator's choice when a configured Kick channel is invalid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TieChoice {
+    /// Re-test the same channel (the failure may be transient).
+    Retry,
+    /// Keep the channel but skip it for now (noted in the log).
+    Ignore,
+    /// Remove the channel from the config.
+    Remove,
+    /// Prompt for a replacement value, save it, and re-test.
+    Edit,
+}
+
+fn parse_tie_choice(answer: &str) -> Option<TieChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "t" | "try" | "retry" | "try again" => Some(TieChoice::Retry),
+        "i" | "ignore" => Some(TieChoice::Ignore),
+        "r" | "remove" => Some(TieChoice::Remove),
+        "e" | "edit" => Some(TieChoice::Edit),
+        _ => None,
+    }
+}
+
+fn tie_choices_help() -> String {
+    "Enter one of: (t)ry again, (i)gnore, (r)emove, (e)dit".to_string()
+}
+
+/// Ask the operator how to handle an invalid entry: (t)ry / (i)gnore /
+/// (r)emove / (e)dit. Reprompts until a valid choice (or None on cancel).
+async fn prompt_tie_choice(
+    write_ws: &mut WsWriteHalf,
+    prompt_rx: &mut mpsc::UnboundedReceiver<PromptResponse>,
+    auth_token: &str,
+    module_name: &str,
+    instance_uuid: &str,
+    subject: &str,
+) -> Option<TieChoice> {
+    loop {
+        let answer = prompt_for_input(
+            write_ws,
+            prompt_rx,
+            auth_token,
+            module_name,
+            instance_uuid,
+            "Invalid Kick Entry",
+            &format!("{}\n\n{}", subject, tie_choices_help()),
+            "t / i / r / e",
+            PromptKind::String,
+            300,
+        )
+        .await;
+        match answer.as_deref().and_then(parse_tie_choice) {
+            Some(c) => return Some(c),
+            None if answer.is_some() => {
+                warn!("Unrecognized choice — expected t / i / r / e.");
+            }
+            None => return None, // cancelled
+        }
+    }
 }
 
 /// Send a Prompt to the engine (forwarded to connected UIs) and wait for the
@@ -488,9 +549,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set when Kick rejects the saved credentials (bad channel / failed
     // chatroom lookup); skips the saved-config fast paths so the module prompts
     // for fresh credentials via the prompt subwindow instead of looping.
-    let mut force_prompt = false;
+    // Never set anymore: the old re-acquire-on-bad-channel spin loop was
+    // replaced by the bounded t/i/r/e resolution below, so it stays false and
+    // the saved-config fast path always runs.
+    let force_prompt = false;
 
-    'configure: loop {
+    // Linear setup phase: resolve config + channel once, then fall through to
+    // the receive-only Pusher loop (never re-prompts in a spin loop).
+    {
         let mut channel_name = env_channel.clone();
         let mut client_id = env_client_id.clone();
         let mut client_secret = env_client_secret.clone();
@@ -656,22 +722,123 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "Resolving Kick channel '{}' to chatroom ID...",
         channel_name
     );
-    let chatroom_id = match fetch_chatroom_id(&http_client, &channel_name).await {
-        Ok(id) => {
-            info!("Successfully resolved chatroom ID: {}", id);
-            id
-        }
-        Err(e) => {
-            error!("Failed to resolve Kick chatroom ID: {}. Re-acquiring credentials...", e);
-            force_prompt = true;
-            channel_name.clear();
-            client_id.clear();
-            client_secret.clear();
-            oauth_token.clear();
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            continue 'configure;
+    // Bounded resolution: on failure the operator explicitly picks how to
+    // proceed (t/i/r/e), so the module never auto-loops on prompts. An empty
+    // id falls through to the receive loop, which idles/retries on its own.
+    let mut setup_log = String::new();
+    let chatroom_id = loop {
+        match fetch_chatroom_id(&http_client, &channel_name).await {
+            Ok(id) => {
+                info!("Successfully resolved chatroom ID: {}", id);
+                break id;
+            }
+            Err(e) => {
+                error!("Failed to resolve Kick chatroom ID: {}", e);
+                let subject = format!("Channel '{}' could not be resolved on Kick.", channel_name);
+                match prompt_tie_choice(
+                    &mut *write_ws_cockatiel.lock().await,
+                    &mut prompt_rx,
+                    &auth_token,
+                    &module_name,
+                    &instance_uuid,
+                    &subject,
+                )
+                .await
+                {
+                    Some(TieChoice::Retry) => {
+                        // Re-resolve the same name (the failure may be transient).
+                        continue;
+                    }
+                    Some(TieChoice::Ignore) => {
+                        setup_log.push_str(&format!(
+                            "channel '{}' invalid — ignored (will retry at runtime)\n",
+                            channel_name
+                        ));
+                        break 0;
+                    }
+                    Some(TieChoice::Remove) => {
+                        setup_log.push_str(&format!(
+                            "channel '{}' invalid — removed\n",
+                            channel_name
+                        ));
+                        if let Some(val) = prompt_for_input(
+                            &mut *write_ws_cockatiel.lock().await,
+                            &mut prompt_rx,
+                            &auth_token,
+                            &module_name,
+                            &instance_uuid,
+                            "Kick Channel Name",
+                            "Enter a new Kick Channel Name / Username (e.g. vulbyte).",
+                            "Kick Channel Name",
+                            PromptKind::String,
+                            300,
+                        )
+                        .await
+                        {
+                            let t = val.trim().to_string();
+                            if !t.is_empty() {
+                                channel_name = t;
+                                continue;
+                            }
+                        }
+                        break 0;
+                    }
+                    Some(TieChoice::Edit) => {
+                        if let Some(val) = prompt_for_input(
+                            &mut *write_ws_cockatiel.lock().await,
+                            &mut prompt_rx,
+                            &auth_token,
+                            &module_name,
+                            &instance_uuid,
+                            "Edit Kick Channel Name",
+                            "Enter the correct Kick Channel Name / Username (e.g. vulbyte).",
+                            "Kick Channel Name",
+                            PromptKind::String,
+                            300,
+                        )
+                        .await
+                        {
+                            let t = val.trim().to_string();
+                            if !t.is_empty() {
+                                channel_name = t;
+                                continue;
+                            }
+                        }
+                        break 0;
+                    }
+                    None => {
+                        setup_log.push_str(&format!(
+                            "channel '{}' invalid — skipped (cancelled)\n",
+                            channel_name
+                        ));
+                        break 0;
+                    }
+                }
+            }
         }
     };
+
+    // Surface the setup summary to the operator (the accumulated log).
+    if !setup_log.trim().is_empty() {
+        let log = Container {
+            version: 1,
+            auth_token: auth_token.clone(),
+            module_name: module_name.clone(),
+            module_instance_uuid7: instance_uuid.clone(),
+            payload: Some(Payload::Log(cockatiel_client::proto::Log {
+                log: format!("[kick-adapter] setup:\n{}", setup_log.trim_end()),
+                blob: vec![],
+            })),
+        };
+        let mut lbuf = Vec::new();
+        if log.encode(&mut lbuf).is_ok() {
+            let _ = write_ws_cockatiel
+                .lock()
+                .await
+                .send(WsMessage::Binary(lbuf))
+                .await;
+        }
+    }
 
     let pusher_url = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.6.0&flash=false";
 
@@ -828,5 +995,22 @@ mod tests {
     #[test]
     fn unrouted_command_is_none() {
         assert!(build_mod_query("!help", "!help", "mod").is_none());
+    }
+
+    #[test]
+    fn tie_choice_parses_all_options() {
+        assert_eq!(parse_tie_choice("t"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("retry"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("try again"), Some(TieChoice::Retry));
+        assert_eq!(parse_tie_choice("i"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("IGNORE"), Some(TieChoice::Ignore));
+        assert_eq!(parse_tie_choice("r"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("remove"), Some(TieChoice::Remove));
+        assert_eq!(parse_tie_choice("e"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("EDIT"), Some(TieChoice::Edit));
+        assert_eq!(parse_tie_choice("x"), None);
+        assert_eq!(parse_tie_choice(""), None);
+        assert_eq!(parse_tie_choice("  edit  "), Some(TieChoice::Edit));
     }
 }
