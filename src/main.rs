@@ -4,7 +4,7 @@ use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient, Pro
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
@@ -439,7 +439,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Kick Adapter Module...");
 
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        // A black-holed Kick API must never leak a task: every platform send
+        // (and the channel/token fetches, which share this client) times out.
+        .timeout(Duration::from_secs(15))
+        .build()?;
 
     // Credentials live in `.env` (written by the engine via set_credentials);
     // load them so the env-var reads below pick them up.
@@ -500,17 +504,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let prompt_tx_task = prompt_tx.clone();
 
     // Shared OAuth token: the configure loop refreshes it each iteration and
-    // the read task uses the latest value for outbound sends.
-    let shared_token: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+    // the outbound worker uses the latest value for platform sends. It's a
+    // tokio Mutex so no `.lock().unwrap()` can panic a task on a poisoned lock.
+    let shared_token: Arc<tokio::sync::Mutex<String>> = Arc::new(tokio::sync::Mutex::new(String::new()));
     let token_for_task = shared_token.clone();
     let client_clone = http_client.clone();
     let write_task = write_ws_cockatiel.clone();
     let identity_task = identity.clone();
+
+    // Bounded outbound send queue: the read loop try_sends (never blocks, never
+    // spawns a per-message task) and a single fixed worker drains it. A reply
+    // flood can't spawn unbounded tasks, and a black-holed Kick API can't leak
+    // them indefinitely — at most 64 messages sit in the queue.
+    let (outbound_tx, outbound_rx) = mpsc::channel::<String>(64);
+    let outbound_tx_task = outbound_tx.clone();
+    let client_worker = client_clone.clone();
+    let token_worker = token_for_task.clone();
+    tokio::spawn(async move {
+        let mut outbound_rx = outbound_rx;
+        while let Some(msg) = outbound_rx.recv().await {
+            // Fresh token at send time — a reconnect may have rotated creds.
+            let token = token_worker.lock().await.clone();
+            if let Err(err) = send_kick_message(&client_worker, &token, &msg).await {
+                error!("Error sending outbound Kick message: {}", err);
+            }
+        }
+    });
     tokio::spawn(async move {
         // Read-loop + engine-session supervisor. When the socket drops the
         // module RECONNECTS instead of going zombie on a dead socket (the old
         // behavior: the platform loop kept pushing into a dead WS forever).
         let mut read = read_ws_cockatiel;
+        let outbound_tx = outbound_tx_task;
         loop {
             // Read until the connection dies.
             while let Some(msg) = read.next().await {
@@ -542,13 +567,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     let _ = w.send(WsMessage::Binary(buf.into())).await;
                                 }
                             } else if let Some(Payload::SendToPlatforms(send)) = container.payload {
-                                let client_ref = client_clone.clone();
-                                let t_ref = token_for_task.lock().unwrap().clone();
-                                tokio::spawn(async move {
-                                    if let Err(err) = send_kick_message(&client_ref, &t_ref, &send.msg).await {
-                                        error!("Error sending outbound Kick message: {}", err);
+                                // Bounded handoff to the outbound worker — never
+                                // block the read loop and never spawn a task per
+                                // message. Overflow is dropped with a warning.
+                                match outbound_tx.try_send(send.msg) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(_)) => {
+                                        warn!("Outbound Kick queue full — dropping platform message");
                                     }
-                                });
+                                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                                        error!("Outbound Kick queue closed — platform message dropped");
+                                    }
+                                }
                             } else if let Some(Payload::PromptResponse(resp)) = container.payload {
                                 // Forward operator answers to the awaiting prompt.
                                 let _ = prompt_tx_task.send(resp);
@@ -557,31 +587,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             // and delivered it here with the parsed Command attached.
                             else if let Some(Payload::MessagePreProcess(pre)) = container.payload {
                                 let Some(chat) = pre.raw_message else { continue };
-                                let Some(cmd) = chat.command else { continue };
-                                if cmd.command_name != "ban" && cmd.command_name != "timeout" {
-                                    continue;
+                                let Some(cmd) = chat.command.as_ref() else { continue };
+                                if cmd.command_name == "ban" || cmd.command_name == "timeout" {
+                                    let author = chat
+                                        .user_data
+                                        .as_ref()
+                                        .map(|u| u.username.clone())
+                                        .unwrap_or_default();
+                                    if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
+                                        let query = Container {
+                                            version: 1,
+                                            auth_token: auth.clone(),
+                                            module_name: module.clone(),
+                                            module_instance_uuid7: instance.clone(),
+                                            payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+                                                query_id: qid,
+                                                sql: payload.to_string(),
+                                                params: vec![],
+                                            })),
+                                        };
+                                        let mut qbuf = Vec::new();
+                                        if query.encode(&mut qbuf).is_ok() {
+                                            let mut w = write_task.lock().await;
+                                            let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                        }
+                                    } else {
+                                        error!(
+                                            "Routed {} command unparseable — executing nothing (still acking)",
+                                            cmd.command_name
+                                        );
+                                    }
                                 }
-                                let author = chat
-                                    .user_data
-                                    .as_ref()
-                                    .map(|u| u.username.clone())
-                                    .unwrap_or_default();
-                                if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
-                                    let query = Container {
+                                // ACK the stage: echo the raw ChatMessage back with the
+                                // SAME message_uuid7 so the engine clears this adapter's
+                                // pending pre-process ack and the message doesn't strand
+                                // until the timeout sweep. Sent on every routed-command
+                                // path (success and error). NEVER ack with an EMPTY
+                                // uuid7 — the engine treats that as a NEW message ingest.
+                                if !pre.message_uuid7.is_empty() {
+                                    let ack = Container {
                                         version: 1,
-                                        auth_token: auth,
-                                        module_name: module,
-                                        module_instance_uuid7: instance,
-                                        payload: Some(Payload::DatabaseQuery(DatabaseQuery {
-                                            query_id: qid,
-                                            sql: payload.to_string(),
-                                            params: vec![],
+                                        auth_token: auth.clone(),
+                                        module_name: module.clone(),
+                                        module_instance_uuid7: instance.clone(),
+                                        payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                                            message_uuid7: pre.message_uuid7.clone(),
+                                            raw_message: Some(chat.clone()),
+                                            audio: vec![],
+                                            audio_type: String::new(),
                                         })),
                                     };
-                                    let mut qbuf = Vec::new();
-                                    if query.encode(&mut qbuf).is_ok() {
+                                    let mut abuf = Vec::new();
+                                    if ack.encode(&mut abuf).is_ok() {
                                         let mut w = write_task.lock().await;
-                                        let _ = w.send(WsMessage::Binary(qbuf.into())).await;
+                                        let _ = w.send(WsMessage::Binary(abuf)).await;
                                     }
                                 }
                             }
@@ -646,7 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut client_secret = env_client_secret.clone();
         let mut oauth_token = env_oauth.clone();
         // Clear the shared token so a stale one isn't used while re-acquiring.
-        shared_token.lock().unwrap().clear();
+        shared_token.lock().await.clear();
 
         // Non-interactive fast path: if a usable saved config exists, use it without
         // prompting (enables the TUI to supply credentials via file). channel +
@@ -799,107 +858,124 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             oauth_token = token;
         }
     }
-    // Publish the latest token so the read task uses it for outbound sends.
-    *shared_token.lock().unwrap() = oauth_token.clone();
+    // Publish the latest token so the outbound worker uses it for platform sends.
+    *shared_token.lock().await = oauth_token.clone();
 
     info!(
         "Resolving Kick channel '{}' to chatroom ID...",
         channel_name
     );
     // Bounded resolution: on failure the operator explicitly picks how to
-    // proceed (t/i/r/e), so the module never auto-loops on prompts. An empty
-    // id falls through to the receive loop, which idles/retries on its own.
+    // proceed (t/i/r/e). The loop NEVER breaks with chatroom_id 0 — the Pusher
+    // subscribe would silently target `chatrooms.0.v2` and idle forever. Any
+    // unresolvable outcome logs a clear error and retries with capped backoff.
     let mut setup_log = String::new();
+    let mut resolve_backoff = 1u64;
     let chatroom_id = loop {
         match fetch_chatroom_id(&http_client, &channel_name).await {
-            Ok(id) => {
+            Ok(id) if id > 0 => {
                 info!("Successfully resolved chatroom ID: {}", id);
                 break id;
             }
+            Ok(_) => {
+                error!(
+                    "Kick returned a zero/bogus chatroom ID for channel '{}' — treating as unresolved.",
+                    channel_name
+                );
+            }
             Err(e) => {
                 error!("Failed to resolve Kick chatroom ID: {}", e);
-                let subject = format!("Channel '{}' could not be resolved on Kick.", channel_name);
-                match prompt_tie_choice(
+            }
+        }
+
+        // Resolution failed for this channel name — ask the operator what to
+        // do (t/i/r/e), or fall back to a backoff retry below.
+        let subject = format!("Channel '{}' could not be resolved on Kick.", channel_name);
+        let mut replacement: Option<String> = None;
+        match prompt_tie_choice(
+            &write_ws_cockatiel,
+            &mut prompt_rx,
+            &auth_token,
+            &module_name,
+            &instance_uuid,
+            &subject,
+        )
+        .await
+        {
+            Some(TieChoice::Retry) => {
+                // Re-resolve the same name (the failure may be transient).
+                continue;
+            }
+            Some(TieChoice::Ignore) => {
+                setup_log.push_str(&format!(
+                    "channel '{}' invalid — ignored (retrying resolution)\n",
+                    channel_name
+                ));
+            }
+            Some(TieChoice::Remove) => {
+                setup_log.push_str(&format!(
+                    "channel '{}' invalid — removed\n",
+                    channel_name
+                ));
+                replacement = prompt_for_input(
                     &write_ws_cockatiel,
                     &mut prompt_rx,
                     &auth_token,
                     &module_name,
                     &instance_uuid,
-                    &subject,
+                    "Kick Channel Name",
+                    "Enter a new Kick Channel Name / Username (e.g. vulbyte).",
+                    "Kick Channel Name",
+                    PromptKind::String,
+                    300,
                 )
-                .await
-                {
-                    Some(TieChoice::Retry) => {
-                        // Re-resolve the same name (the failure may be transient).
-                        continue;
-                    }
-                    Some(TieChoice::Ignore) => {
-                        setup_log.push_str(&format!(
-                            "channel '{}' invalid — ignored (will retry at runtime)\n",
-                            channel_name
-                        ));
-                        break 0;
-                    }
-                    Some(TieChoice::Remove) => {
-                        setup_log.push_str(&format!(
-                            "channel '{}' invalid — removed\n",
-                            channel_name
-                        ));
-                        if let Some(val) = prompt_for_input(
-                            &write_ws_cockatiel,
-                            &mut prompt_rx,
-                            &auth_token,
-                            &module_name,
-                            &instance_uuid,
-                            "Kick Channel Name",
-                            "Enter a new Kick Channel Name / Username (e.g. vulbyte).",
-                            "Kick Channel Name",
-                            PromptKind::String,
-                            300,
-                        )
-                        .await
-                        {
-                            let t = val.trim().to_string();
-                            if !t.is_empty() {
-                                channel_name = t;
-                                continue;
-                            }
-                        }
-                        break 0;
-                    }
-                    Some(TieChoice::Edit) => {
-                        if let Some(val) = prompt_for_input(
-                            &write_ws_cockatiel,
-                            &mut prompt_rx,
-                            &auth_token,
-                            &module_name,
-                            &instance_uuid,
-                            "Edit Kick Channel Name",
-                            "Enter the correct Kick Channel Name / Username (e.g. vulbyte).",
-                            "Kick Channel Name",
-                            PromptKind::String,
-                            300,
-                        )
-                        .await
-                        {
-                            let t = val.trim().to_string();
-                            if !t.is_empty() {
-                                channel_name = t;
-                                continue;
-                            }
-                        }
-                        break 0;
-                    }
-                    None => {
-                        setup_log.push_str(&format!(
-                            "channel '{}' invalid — skipped (cancelled)\n",
-                            channel_name
-                        ));
-                        break 0;
-                    }
-                }
+                .await;
+            }
+            Some(TieChoice::Edit) => {
+                replacement = prompt_for_input(
+                    &write_ws_cockatiel,
+                    &mut prompt_rx,
+                    &auth_token,
+                    &module_name,
+                    &instance_uuid,
+                    "Edit Kick Channel Name",
+                    "Enter the correct Kick Channel Name / Username (e.g. vulbyte).",
+                    "Kick Channel Name",
+                    PromptKind::String,
+                    300,
+                )
+                .await;
+            }
+            None => {
+                setup_log.push_str(&format!(
+                    "channel '{}' invalid — skipped (cancelled)\n",
+                    channel_name
+                ));
             }
         }
+
+        if let Some(t) = replacement {
+            let t = t.trim().to_string();
+            if !t.is_empty() {
+                channel_name = t;
+                resolve_backoff = 1;
+                continue;
+            }
+        }
+
+        // Never proceed with chatroom_id 0. Log a clear error and retry the
+        // resolution with capped backoff (the module self-heals when Kick's
+        // API recovers instead of silently subscribing to chatroom 0).
+        error!(
+            "Kick channel '{}' could not be resolved — NOT subscribing to chatroom 0. Retrying resolution in {}s.",
+            channel_name, resolve_backoff
+        );
+        setup_log.push_str(&format!(
+            "channel '{}' unresolved — retrying resolution in {}s\n",
+            channel_name, resolve_backoff
+        ));
+        tokio::time::sleep(Duration::from_secs(resolve_backoff)).await;
+        resolve_backoff = (resolve_backoff * 2).min(30);
     };
 
     // Surface the setup summary to the operator (the accumulated log).
