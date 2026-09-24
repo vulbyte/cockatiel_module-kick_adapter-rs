@@ -76,17 +76,56 @@ async fn register_commands(
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 struct KickAdapterConfig {
     channel_name: Option<String>,
     client_id: Option<String>,
     client_secret: Option<String>,
     oauth_token: Option<String>,
+    default_timeout_secs: i64,
+    http_timeout_secs: u64,
+    outbound_queue_cap: usize,
+    reconnect_base_secs: u64,
+    reconnect_max_secs: u64,
+    chatroom_resolve_base_secs: u64,
+    chatroom_resolve_max_secs: u64,
+    pusher_ping_interval_secs: u64,
+    pusher_reconnect_delay_secs: u64,
+    ws_retry_delay_secs: u64,
+    prompt_timeout_secs: u32,
+}
+
+impl Default for KickAdapterConfig {
+    fn default() -> Self {
+        Self {
+            channel_name: None,
+            client_id: None,
+            client_secret: None,
+            oauth_token: None,
+            default_timeout_secs: 300,
+            http_timeout_secs: 15,
+            outbound_queue_cap: 64,
+            reconnect_base_secs: 1,
+            reconnect_max_secs: 30,
+            chatroom_resolve_base_secs: 1,
+            chatroom_resolve_max_secs: 30,
+            pusher_ping_interval_secs: 30,
+            pusher_reconnect_delay_secs: 5,
+            ws_retry_delay_secs: 5,
+            prompt_timeout_secs: 300,
+        }
+    }
 }
 
 /// Build a moderator query from the engine-routed command. The engine already
 /// parsed + routed `!ban`/`!timeout`; here we map command_name -> query and
 /// extract the target/reason from the message args (no re-parsing).
-fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(String, serde_json::Value)> {
+fn build_mod_query(
+    command_name: &str,
+    message: &str,
+    author: &str,
+    default_timeout_secs: i64,
+) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.trim().split_whitespace();
     let _cmd = tokens.next()?;
     match command_name {
@@ -111,7 +150,7 @@ fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(S
             if target.is_empty() {
                 return None;
             }
-            let mut duration_secs = 300i64;
+            let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
                 if let Ok(secs) = d.parse::<i64>() {
@@ -144,22 +183,64 @@ fn build_mod_query(command_name: &str, message: &str, author: &str) -> Option<(S
     }
 }
 
+/// Backfill any missing tunables into `module_specific` with their defaults,
+/// so every setting is always present and editable in place. Leaves
+/// `channel_name` (managed by save_adapter_config) untouched.
+fn backfill_adapter_config_defaults() {
+    let path = PathBuf::from("config.json");
+    let Ok(data) = std::fs::read_to_string(&path) else { return; };
+    let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&data) else { return; };
+    let mut ms = json_val
+        .get("module_specific")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let before = ms.clone();
+    let defaults: [(&str, i64); 11] = [
+        ("default_timeout_secs", 300),
+        ("http_timeout_secs", 15),
+        ("outbound_queue_cap", 64),
+        ("reconnect_base_secs", 1),
+        ("reconnect_max_secs", 30),
+        ("chatroom_resolve_base_secs", 1),
+        ("chatroom_resolve_max_secs", 30),
+        ("pusher_ping_interval_secs", 30),
+        ("pusher_reconnect_delay_secs", 5),
+        ("ws_retry_delay_secs", 5),
+        ("prompt_timeout_secs", 300),
+    ];
+    for (key, value) in defaults {
+        if ms.get(key).is_none() {
+            ms[key] = serde_json::json!(value);
+        }
+    }
+    if ms != before {
+        json_val["module_specific"] = ms;
+        if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
+            let _ = std::fs::write(&path, pretty);
+        }
+    }
+}
+
 fn load_adapter_config() -> Option<KickAdapterConfig> {
     // The channel name is PUBLIC (visible to anyone on the stream) → config.json;
     // client id/secret/oauth are secrets → `.env` (env vars loaded at startup).
-    let channel_name = std::fs::read_to_string("config.json")
+    // Missing tuning keys are backfilled with their defaults into module_specific.
+    backfill_adapter_config_defaults();
+    let saved = std::fs::read_to_string("config.json")
         .ok()
         .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
         .and_then(|v| v.get("module_specific").cloned())
-        .and_then(|s| s.get("channel_name").cloned())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let channel_name = saved
+        .get("channel_name")
         .and_then(|c| c.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| std::env::var("KICK_CHANNEL_NAME").unwrap_or_default());
-    Some(KickAdapterConfig {
-        channel_name: Some(channel_name),
-        client_id: Some(std::env::var("KICK_CLIENT_ID").unwrap_or_default()),
-        client_secret: Some(std::env::var("KICK_CLIENT_SECRET").unwrap_or_default()),
-        oauth_token: Some(std::env::var("KICK_OAUTH_TOKEN").unwrap_or_default()),
-    })
+    let mut cfg: KickAdapterConfig = serde_json::from_value(saved).unwrap_or_default();
+    cfg.channel_name = Some(channel_name);
+    cfg.client_id = Some(std::env::var("KICK_CLIENT_ID").unwrap_or_default());
+    cfg.client_secret = Some(std::env::var("KICK_CLIENT_SECRET").unwrap_or_default());
+    cfg.oauth_token = Some(std::env::var("KICK_OAUTH_TOKEN").unwrap_or_default());
+    Some(cfg)
     .filter(|c| {
         !c.channel_name.as_deref().unwrap_or("").is_empty()
             && !c.client_id.as_deref().unwrap_or("").is_empty()
@@ -231,6 +312,7 @@ async fn prompt_tie_choice(
     module_name: &str,
     instance_uuid: &str,
     subject: &str,
+    prompt_timeout_secs: u32,
 ) -> Option<TieChoice> {
     loop {
         let answer = prompt_for_input(
@@ -243,7 +325,7 @@ async fn prompt_tie_choice(
             &format!("{}\n\n{}", subject, tie_choices_help()),
             "t / i / r / e",
             PromptKind::String,
-            300,
+            prompt_timeout_secs,
         )
         .await;
         match answer.as_deref().and_then(parse_tie_choice) {
@@ -439,15 +521,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("Starting Kick Adapter Module...");
 
+    // Credentials live in `.env` (written by the engine via set_credentials);
+    // load them first so both load_adapter_config() below and the env-var reads
+    // pick them up.
+    cockatiel_client::load_env_file(".env");
+
+    // Tunables live in config.json under `module_specific` (backfilled with
+    // defaults on load). Read once and thread the values into the HTTP client,
+    // the configure phase, the engine reconnect supervisor, and the Pusher loop.
+    let adapter_config = load_adapter_config().unwrap_or_default();
+
     let http_client = reqwest::Client::builder()
         // A black-holed Kick API must never leak a task: every platform send
         // (and the channel/token fetches, which share this client) times out.
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(adapter_config.http_timeout_secs))
         .build()?;
-
-    // Credentials live in `.env` (written by the engine via set_credentials);
-    // load them so the env-var reads below pick them up.
-    cockatiel_client::load_env_file(".env");
 
     // Re-acquire credentials whenever Kick rejects them (bad channel/oauth).
     // Env vars are read once; on rejection the locals are cleared so the
@@ -503,6 +591,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (prompt_tx, mut prompt_rx) = mpsc::unbounded_channel::<PromptResponse>();
     let prompt_tx_task = prompt_tx.clone();
 
+    // Values threaded into the engine reconnect supervisor spawn below.
+    let default_timeout_secs = adapter_config.default_timeout_secs;
+    let reconnect_base_secs = adapter_config.reconnect_base_secs;
+    let reconnect_max_secs = adapter_config.reconnect_max_secs;
+
     // Shared OAuth token: the configure loop refreshes it each iteration and
     // the outbound worker uses the latest value for platform sends. It's a
     // tokio Mutex so no `.lock().unwrap()` can panic a task on a poisoned lock.
@@ -516,7 +609,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // spawns a per-message task) and a single fixed worker drains it. A reply
     // flood can't spawn unbounded tasks, and a black-holed Kick API can't leak
     // them indefinitely — at most 64 messages sit in the queue.
-    let (outbound_tx, outbound_rx) = mpsc::channel::<String>(64);
+    let (outbound_tx, outbound_rx) = mpsc::channel::<String>(adapter_config.outbound_queue_cap);
     let outbound_tx_task = outbound_tx.clone();
     let client_worker = client_clone.clone();
     let token_worker = token_for_task.clone();
@@ -594,7 +687,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         .as_ref()
                                         .map(|u| u.username.clone())
                                         .unwrap_or_default();
-                                    if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author) {
+                                    if let Some((qid, payload)) = build_mod_query(&cmd.command_name, &chat.raw_message, &author, default_timeout_secs) {
                                         let query = Container {
                                             version: 1,
                                             auth_token: auth.clone(),
@@ -661,7 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The engine connection dropped — reconnect with backoff instead of
             // leaving the platform loop pushing into a dead socket.
             info!("Engine disconnected — reconnecting...");
-            let mut backoff = 1u64;
+            let mut backoff = reconnect_base_secs;
             loop {
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
                 match CockatielClient::connect("config.json").await {
@@ -682,7 +775,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         error!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
-                        backoff = (backoff * 2).min(30);
+                        backoff = (backoff * 2).min(reconnect_max_secs);
                     }
                 }
             }
@@ -783,7 +876,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Enter your Kick Channel Name / Username (e.g. vulbyte).",
             "Kick Channel Name",
             PromptKind::String,
-            300,
+            adapter_config.prompt_timeout_secs,
         )
         .await;
         if let Some(val) = input {
@@ -810,7 +903,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              credentials.",
             "Client ID",
             PromptKind::String,
-            300,
+            adapter_config.prompt_timeout_secs,
         )
         .await;
         if let Some(val) = input {
@@ -828,7 +921,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Enter the Client Secret for the Kick application above.",
                 "Client Secret",
                 PromptKind::Credential,
-                300,
+                adapter_config.prompt_timeout_secs,
             )
             .await;
             if let Some(val) = input {
@@ -870,7 +963,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // subscribe would silently target `chatrooms.0.v2` and idle forever. Any
     // unresolvable outcome logs a clear error and retries with capped backoff.
     let mut setup_log = String::new();
-    let mut resolve_backoff = 1u64;
+    let mut resolve_backoff = adapter_config.chatroom_resolve_base_secs;
     let chatroom_id = loop {
         match fetch_chatroom_id(&http_client, &channel_name).await {
             Ok(id) if id > 0 => {
@@ -899,6 +992,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             &module_name,
             &instance_uuid,
             &subject,
+            adapter_config.prompt_timeout_secs,
         )
         .await
         {
@@ -927,7 +1021,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Enter a new Kick Channel Name / Username (e.g. vulbyte).",
                     "Kick Channel Name",
                     PromptKind::String,
-                    300,
+                    adapter_config.prompt_timeout_secs,
                 )
                 .await;
             }
@@ -942,7 +1036,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Enter the correct Kick Channel Name / Username (e.g. vulbyte).",
                     "Kick Channel Name",
                     PromptKind::String,
-                    300,
+                    adapter_config.prompt_timeout_secs,
                 )
                 .await;
             }
@@ -958,7 +1052,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = t.trim().to_string();
             if !t.is_empty() {
                 channel_name = t;
-                resolve_backoff = 1;
+                resolve_backoff = adapter_config.chatroom_resolve_base_secs;
                 continue;
             }
         }
@@ -975,7 +1069,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             channel_name, resolve_backoff
         ));
         tokio::time::sleep(Duration::from_secs(resolve_backoff)).await;
-        resolve_backoff = (resolve_backoff * 2).min(30);
+        resolve_backoff = (resolve_backoff * 2).min(adapter_config.chatroom_resolve_max_secs);
     };
 
     // Surface the setup summary to the operator (the accumulated log).
@@ -1009,7 +1103,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(r) => r,
             Err(e) => {
                 error!("Failed to build WebSocket request: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    adapter_config.ws_retry_delay_secs,
+                ))
+                .await;
                 continue;
             }
         };
@@ -1022,17 +1119,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(conn) => conn,
             Err(e) => {
                 error!(
-                    "Failed to connect to Kick WebSocket: {}. Retrying in 5 seconds...",
-                    e
+                    "Failed to connect to Kick WebSocket: {}. Retrying in {} seconds...",
+                    e,
+                    adapter_config.ws_retry_delay_secs
                 );
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                tokio::time::sleep(tokio::time::Duration::from_secs(
+                    adapter_config.ws_retry_delay_secs,
+                ))
+                .await;
                 continue;
             }
         };
 
         info!("Connected to Kick WebSocket layer!");
 
-        let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(
+            adapter_config.pusher_ping_interval_secs,
+        ));
 
         loop {
             tokio::select! {
@@ -1133,7 +1236,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(
+            adapter_config.pusher_reconnect_delay_secs,
+        ))
+        .await;
         }
     }
 }
@@ -1144,7 +1250,7 @@ mod tests {
 
     #[test]
     fn ban_parses_target_and_reason() {
-        let (qid, p) = build_mod_query("ban", "!ban @user being awful", "mod").unwrap();
+        let (qid, p) = build_mod_query("ban", "!ban @user being awful", "mod", 300).unwrap();
         assert_eq!(qid, "mod_ban");
         assert_eq!(p["handle"], "user");
         assert_eq!(p["reason"], "being awful");
@@ -1153,7 +1259,7 @@ mod tests {
 
     #[test]
     fn timeout_parses_duration_and_reason() {
-        let (qid, p) = build_mod_query("timeout", "!timeout @user 600 spamming", "mod").unwrap();
+        let (qid, p) = build_mod_query("timeout", "!timeout @user 600 spamming", "mod", 300).unwrap();
         assert_eq!(qid, "mod_timeout");
         assert_eq!(p["duration_secs"], 600);
         assert_eq!(p["reason"], "spamming");
@@ -1161,7 +1267,7 @@ mod tests {
 
     #[test]
     fn unrouted_command_is_none() {
-        assert!(build_mod_query("!help", "!help", "mod").is_none());
+        assert!(build_mod_query("!help", "!help", "mod", 300).is_none());
     }
 
     #[test]
