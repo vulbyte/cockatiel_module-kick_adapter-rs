@@ -188,8 +188,10 @@ fn build_mod_query(
 /// `channel_name` (managed by save_adapter_config) untouched.
 fn backfill_adapter_config_defaults() {
     let path = PathBuf::from("config.json");
-    let Ok(data) = std::fs::read_to_string(&path) else { return; };
-    let Ok(mut json_val) = serde_json::from_str::<serde_json::Value>(&data) else { return; };
+    let mut json_val = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
     let mut ms = json_val
         .get("module_specific")
         .cloned()
@@ -255,16 +257,24 @@ fn save_adapter_config(
     oauth_token: &str,
 ) {
     // The channel name is public → config.json; secrets → `.env`.
+    // Merge the channel name in WITHOUT clobbering the tuning knobs, so a
+    // re-configure never resets tuned values back to their defaults. Creates
+    // config.json if it doesn't exist yet.
     let path = PathBuf::from("config.json");
-    let mut json_val = if let Ok(data) = std::fs::read_to_string(&path) {
-        serde_json::from_str::<serde_json::Value>(&data).unwrap_or_else(|_| json!({}))
-    } else {
-        json!({})
-    };
-    json_val["module_specific"] = json!({ "channel_name": channel_name });
+    let mut json_val = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .unwrap_or_else(|| json!({}));
+    if json_val.get("module_specific").and_then(|v| v.as_object()).is_none() {
+        json_val["module_specific"] = serde_json::json!({});
+    }
+    let ms = json_val["module_specific"].as_object_mut().unwrap();
+    ms.insert("channel_name".to_string(), serde_json::json!(channel_name));
     if let Ok(pretty) = serde_json::to_string_pretty(&json_val) {
         let _ = std::fs::write(&path, pretty);
     }
+    // Ensure the tuning knobs exist on disk even on a first run.
+    backfill_adapter_config_defaults();
     cockatiel_client::write_env_file(
         ".env",
         &[
