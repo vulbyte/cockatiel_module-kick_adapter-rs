@@ -93,6 +93,14 @@ struct KickAdapterConfig {
     pusher_reconnect_delay_secs: u64,
     ws_retry_delay_secs: u64,
     prompt_timeout_secs: u32,
+    /// How often (seconds) the adapter polls Kick's channel API for live status.
+    #[serde(default = "default_stream_poll_interval_secs")]
+    stream_poll_interval_secs: u64,
+}
+
+/// Default interval (seconds) between Kick live-status polls.
+fn default_stream_poll_interval_secs() -> u64 {
+    30
 }
 
 impl Default for KickAdapterConfig {
@@ -113,6 +121,7 @@ impl Default for KickAdapterConfig {
             pusher_reconnect_delay_secs: 5,
             ws_retry_delay_secs: 5,
             prompt_timeout_secs: 300,
+            stream_poll_interval_secs: 30,
         }
     }
 }
@@ -197,7 +206,7 @@ fn backfill_adapter_config_defaults() {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i64); 11] = [
+    let defaults: [(&str, i64); 12] = [
         ("default_timeout_secs", 300),
         ("http_timeout_secs", 15),
         ("outbound_queue_cap", 64),
@@ -209,6 +218,7 @@ fn backfill_adapter_config_defaults() {
         ("pusher_reconnect_delay_secs", 5),
         ("ws_retry_delay_secs", 5),
         ("prompt_timeout_secs", 300),
+        ("stream_poll_interval_secs", 30),
     ];
     for (key, value) in defaults {
         if ms.get(key).is_none() {
@@ -554,6 +564,156 @@ async fn send_kick_message(
     }
 
     Ok(())
+}
+
+/// Format the current UTC time as ISO 8601 (`YYYY-MM-DDTHH:MM:SSZ`) without
+/// pulling in chrono, for when Kick's `livestream.created_at` is missing.
+fn now_utc_iso8601() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let (year, month, day) = civil_from_days((secs / 86_400) as i64);
+    let hour = secs / 3_600 % 24;
+    let minute = secs / 60 % 60;
+    let second = secs % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        year, month, day, hour, minute, second
+    )
+}
+
+/// Convert days since 1970-01-01 to a (year, month, day) civil date.
+/// (Howard Hinnant's `civil_from_days` algorithm.)
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Build the exact `[stream-start]` event message.
+fn stream_start_message(channel: &str, started_at: &str, title: &str) -> String {
+    format!(
+        "[stream-start] kick: channel '{}' went live at {} — title: \"{}\"",
+        channel, started_at, title
+    )
+}
+
+/// Offline→online transition detector. Emits exactly once per stream: only when
+/// the channel WAS offline and IS now live.
+fn should_emit_stream_start(was_live: bool, is_live: bool) -> bool {
+    !was_live && is_live
+}
+
+/// Poll Kick's channel API and return the live status. `Some((created_at,
+/// session_title))` when the top-level `livestream` object is present; `None`
+/// when it is null/missing (channel offline).
+async fn fetch_stream_status(
+    client: &reqwest::Client,
+    name: &str,
+) -> Result<Option<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+    let clean_name = name.trim().strip_prefix('@').unwrap_or(name.trim());
+    let url = format!("https://kick.com/api/v2/channels/{}", clean_name);
+
+    let res = client
+        .get(&url)
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .send()
+        .await?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let Some(livestream) = res.get("livestream") else {
+        return Ok(None);
+    };
+    if livestream.is_null() {
+        return Ok(None);
+    }
+    let started_at = livestream
+        .get("created_at")
+        .and_then(|c| c.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(now_utc_iso8601);
+    let title = livestream
+        .get("session_title")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .to_string();
+    Ok(Some((started_at, title)))
+}
+
+/// Send a `[stream-start]` Log to the engine (broadcast to the TUI + persisted
+/// to the timeline). Reads the CURRENT session identity at send time so a
+/// reconnect's fresh credentials are used.
+async fn emit_stream_start(
+    write: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    channel: &str,
+    started_at: &str,
+    title: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::Log(cockatiel_client::proto::Log {
+            log: stream_start_message(channel, started_at, title),
+            blob: vec![],
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+    info!("Emitted stream-start event for channel '{}'", channel);
+}
+
+/// Background task: every `poll_interval_secs`, poll Kick's channel API and
+/// emit a `[stream-start]` event on the offline→online transition. Failed polls
+/// are skipped quietly. Outlives engine reconnects because the identity + write
+/// half are re-read on every emit.
+fn spawn_stream_monitor(
+    client: reqwest::Client,
+    channel: String,
+    poll_interval_secs: u64,
+    write: Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
+) {
+    tokio::spawn(async move {
+        let mut was_live = false;
+        let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // burn the immediate first tick
+        loop {
+            interval.tick().await;
+            match fetch_stream_status(&client, &channel).await {
+                Ok(Some((started_at, title))) => {
+                    if should_emit_stream_start(was_live, true) {
+                        emit_stream_start(&write, &identity, &channel, &started_at, &title).await;
+                    }
+                    was_live = true;
+                }
+                Ok(None) => was_live = false,
+                Err(_) => {} // failed poll — skip this tick quietly
+            }
+        }
+    });
 }
 
 #[tokio::main]
@@ -1119,6 +1279,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         resolve_backoff = (resolve_backoff * 2).min(adapter_config.chatroom_resolve_max_secs);
     };
 
+    // Stream-live monitor: polls Kick's channel API and emits a `[stream-start]`
+    // event (broadcast to the TUI + persisted to the timeline) the moment the
+    // configured channel goes live. Only runs when a usable channel and real
+    // credentials exist.
+    if !channel_name.is_empty() && (!client_secret.is_empty() || !oauth_token.is_empty()) {
+        spawn_stream_monitor(
+            http_client.clone(),
+            channel_name.clone(),
+            adapter_config.stream_poll_interval_secs,
+            write_ws_cockatiel.clone(),
+            identity.clone(),
+        );
+    }
+
     // Surface the setup summary to the operator (the accumulated log).
     if !setup_log.trim().is_empty() {
         let log = Container {
@@ -1332,6 +1506,48 @@ mod tests {
         assert_eq!(parse_tie_choice("x"), None);
         assert_eq!(parse_tie_choice(""), None);
         assert_eq!(parse_tie_choice("  edit  "), Some(TieChoice::Edit));
+    }
+
+    #[test]
+    fn stream_start_message_formats_exact_message() {
+        let msg = stream_start_message("vulbyte", "2026-09-24T10:00:00.000Z", "Coffee & Code");
+        assert_eq!(
+            msg,
+            "[stream-start] kick: channel 'vulbyte' went live at 2026-09-24T10:00:00.000Z — title: \"Coffee & Code\""
+        );
+    }
+
+    #[test]
+    fn stream_start_message_defaults_title_to_empty() {
+        let msg = stream_start_message("vulbyte", "2026-09-24T10:00:00.000Z", "");
+        assert!(msg.ends_with("— title: \"\""));
+    }
+
+    #[test]
+    fn should_emit_only_on_offline_to_online_transition() {
+        assert!(should_emit_stream_start(false, true));
+        assert!(!should_emit_stream_start(true, true));
+        assert!(!should_emit_stream_start(false, false));
+        assert!(!should_emit_stream_start(true, false));
+    }
+
+    #[test]
+    fn civil_from_days_matches_known_dates() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(19_723), (2024, 1, 1));
+        assert_eq!(civil_from_days(20_332), (2025, 9, 1));
+    }
+
+    #[test]
+    fn now_utc_iso8601_is_iso_format() {
+        let s = now_utc_iso8601();
+        assert_eq!(s.len(), 20, "expected YYYY-MM-DDTHH:MM:SSZ");
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
     }
 
     #[test]
