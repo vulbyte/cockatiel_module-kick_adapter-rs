@@ -618,7 +618,7 @@ fn should_emit_stream_start(was_live: bool, is_live: bool) -> bool {
 async fn fetch_stream_status(
     client: &reqwest::Client,
     name: &str,
-) -> Result<Option<(String, String)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<(String, String, i64)>, Box<dyn std::error::Error + Send + Sync>> {
     let clean_name = name.trim().strip_prefix('@').unwrap_or(name.trim());
     let url = format!("https://kick.com/api/v2/channels/{}", clean_name);
 
@@ -649,7 +649,55 @@ async fn fetch_stream_status(
         .and_then(|t| t.as_str())
         .unwrap_or("")
         .to_string();
-    Ok(Some((started_at, title)))
+    let viewers = livestream
+        .get("viewers")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    Ok(Some((started_at, title, viewers)))
+}
+
+/// Push this channel's current viewer count to the engine via a `ChannelStats`
+/// payload. The engine stores it and serves it to other modules through the
+/// `channel_viewers` virtual query. Reads the session identity at send time.
+async fn push_channel_stats(
+    write: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    platform: &str,
+    channel: &str,
+    viewers: i64,
+    is_live: bool,
+    title: &str,
+) {
+    let (auth, module, instance) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.module.clone(), id.instance.clone())
+    };
+    let container = Container {
+        version: 1,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(Payload::ChannelStats(cockatiel_client::proto::ChannelStats {
+            platform: platform.to_string(),
+            channel: channel.to_string(),
+            viewers,
+            is_live,
+            title: title.to_string(),
+            updated_at: now_unix_millis(),
+        })),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
+fn now_unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Send a `[stream-start]` Log to the engine (broadcast to the TUI + persisted
@@ -703,13 +751,35 @@ fn spawn_stream_monitor(
         loop {
             interval.tick().await;
             match fetch_stream_status(&client, &channel).await {
-                Ok(Some((started_at, title))) => {
+                Ok(Some((started_at, title, viewers))) => {
+                    push_channel_stats(
+                        &write,
+                        &identity,
+                        "kick",
+                        &channel,
+                        viewers,
+                        true,
+                        &title,
+                    )
+                    .await;
                     if should_emit_stream_start(was_live, true) {
                         emit_stream_start(&write, &identity, &channel, &started_at, &title).await;
                     }
                     was_live = true;
                 }
-                Ok(None) => was_live = false,
+                Ok(None) => {
+                    push_channel_stats(
+                        &write,
+                        &identity,
+                        "kick",
+                        &channel,
+                        0,
+                        false,
+                        "",
+                    )
+                    .await;
+                    was_live = false;
+                }
                 Err(_) => {} // failed poll — skip this tick quietly
             }
         }
