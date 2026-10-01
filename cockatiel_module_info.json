@@ -25,6 +25,7 @@
   ],
   "capabilities": "input",
   "command_flags": [
+    "run",
     "--release"
   ],
   "credentials": [
@@ -59,7 +60,7 @@
     }
   ],
   "description": "a module to interface with kick.com",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "min_rank": 0,
   "name": "kick-adapter",
   "price": 0,
