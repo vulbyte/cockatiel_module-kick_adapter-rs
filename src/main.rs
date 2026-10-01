@@ -85,24 +85,24 @@ struct KickAdapterConfig {
     client_id: Option<String>,
     client_secret: Option<String>,
     oauth_token: Option<String>,
-    default_timeout_secs: i64,
-    http_timeout_secs: u64,
+    default_timeout_secs: i32,
+    http_timeout_secs: u32,
     outbound_queue_cap: usize,
-    reconnect_base_secs: u64,
-    reconnect_max_secs: u64,
-    chatroom_resolve_base_secs: u64,
-    chatroom_resolve_max_secs: u64,
-    pusher_ping_interval_secs: u64,
-    pusher_reconnect_delay_secs: u64,
-    ws_retry_delay_secs: u64,
+    reconnect_base_secs: u32,
+    reconnect_max_secs: u32,
+    chatroom_resolve_base_secs: u32,
+    chatroom_resolve_max_secs: u32,
+    pusher_ping_interval_secs: u32,
+    pusher_reconnect_delay_secs: u32,
+    ws_retry_delay_secs: u32,
     prompt_timeout_secs: u32,
     /// How often (seconds) the adapter polls Kick's channel API for live status.
     #[serde(default = "default_stream_poll_interval_secs")]
-    stream_poll_interval_secs: u64,
+    stream_poll_interval_secs: u32,
 }
 
 /// Default interval (seconds) between Kick live-status polls.
-fn default_stream_poll_interval_secs() -> u64 {
+fn default_stream_poll_interval_secs() -> u32 {
     30
 }
 
@@ -136,7 +136,7 @@ fn build_mod_query(
     command_name: &str,
     message: &str,
     author: &str,
-    default_timeout_secs: i64,
+    default_timeout_secs: i32,
 ) -> Option<(String, serde_json::Value)> {
     let mut tokens = message.trim().split_whitespace();
     let _cmd = tokens.next()?;
@@ -165,7 +165,7 @@ fn build_mod_query(
             let mut duration_secs = default_timeout_secs;
             let mut reason = String::new();
             if let Some(d) = tokens.next() {
-                if let Ok(secs) = d.parse::<i64>() {
+                if let Ok(secs) = d.parse::<i32>() {
                     duration_secs = secs;
                 } else {
                     reason = d.to_string();
@@ -209,7 +209,7 @@ fn backfill_adapter_config_defaults() {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
-    let defaults: [(&str, i64); 12] = [
+    let defaults: [(&str, i32); 12] = [
         ("default_timeout_secs", 300),
         ("http_timeout_secs", 15),
         ("outbound_queue_cap", 64),
@@ -621,7 +621,7 @@ fn should_emit_stream_start(was_live: bool, is_live: bool) -> bool {
 async fn fetch_stream_status(
     client: &reqwest::Client,
     name: &str,
-) -> Result<Option<(String, String, i64)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Option<(String, String, i32)>, Box<dyn std::error::Error + Send + Sync>> {
     let clean_name = name.trim().strip_prefix('@').unwrap_or(name.trim());
     let url = format!("https://kick.com/api/v2/channels/{}", clean_name);
 
@@ -655,6 +655,7 @@ async fn fetch_stream_status(
     let viewers = livestream
         .get("viewers")
         .and_then(|v| v.as_i64())
+        .map(|n| n as i32)
         .unwrap_or(0);
     Ok(Some((started_at, title, viewers)))
 }
@@ -667,7 +668,7 @@ async fn push_channel_stats(
     identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
     platform: &str,
     channel: &str,
-    viewers: i64,
+    viewers: i32,
     is_live: bool,
     title: &str,
 ) {
@@ -683,7 +684,7 @@ async fn push_channel_stats(
         payload: Some(EnginePayload::ChannelStats(cockatiel_client::proto::ChannelStats {
             platform: platform.to_string(),
             channel: channel.to_string(),
-            viewers,
+            viewers: viewers as i64,
             is_live,
             title: title.to_string(),
             updated_at: now_unix_millis(),
@@ -742,13 +743,13 @@ async fn emit_stream_start(
 fn spawn_stream_monitor(
     client: reqwest::Client,
     channel: String,
-    poll_interval_secs: u64,
+    poll_interval_secs: u32,
     write: Arc<tokio::sync::Mutex<WsWriteHalf>>,
     identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
 ) {
     tokio::spawn(async move {
         let mut was_live = false;
-        let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs.max(1)));
+        let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs.max(1) as u64));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         interval.tick().await; // burn the immediate first tick
         loop {
@@ -814,7 +815,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = reqwest::Client::builder()
         // A black-holed Kick API must never leak a task: every platform send
         // (and the channel/token fetches, which share this client) times out.
-        .timeout(Duration::from_secs(adapter_config.http_timeout_secs))
+        .timeout(Duration::from_secs(adapter_config.http_timeout_secs as u64))
         .build()?;
 
     // Re-acquire credentials whenever Kick rejects them (bad channel/oauth).
@@ -1055,7 +1056,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Engine disconnected — reconnecting...");
             let mut backoff = reconnect_base_secs;
             loop {
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                tokio::time::sleep(Duration::from_secs(backoff as u64)).await;
                 match CockatielClient::connect("config.json").await {
                     Ok(conn) => {
                         info!("Reconnected to engine");
@@ -1367,7 +1368,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "channel '{}' unresolved — retrying resolution in {}s\n",
             channel_name, resolve_backoff
         ));
-        tokio::time::sleep(Duration::from_secs(resolve_backoff)).await;
+        tokio::time::sleep(Duration::from_secs(resolve_backoff as u64)).await;
         resolve_backoff = (resolve_backoff * 2).min(adapter_config.chatroom_resolve_max_secs);
     };
 
@@ -1417,7 +1418,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 error!("Failed to build WebSocket request: {}", e);
                 tokio::time::sleep(tokio::time::Duration::from_secs(
-                    adapter_config.ws_retry_delay_secs,
+                    adapter_config.ws_retry_delay_secs as u64,
                 ))
                 .await;
                 continue;
@@ -1437,7 +1438,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     adapter_config.ws_retry_delay_secs
                 );
                 tokio::time::sleep(tokio::time::Duration::from_secs(
-                    adapter_config.ws_retry_delay_secs,
+                    adapter_config.ws_retry_delay_secs as u64,
                 ))
                 .await;
                 continue;
@@ -1447,7 +1448,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         info!("Connected to Kick WebSocket layer!");
 
         let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(
-            adapter_config.pusher_ping_interval_secs,
+            adapter_config.pusher_ping_interval_secs as u64,
         ));
 
         loop {
@@ -1550,7 +1551,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(
-            adapter_config.pusher_reconnect_delay_secs,
+            adapter_config.pusher_reconnect_delay_secs as u64,
         ))
         .await;
         }
