@@ -684,7 +684,7 @@ async fn push_channel_stats(
         payload: Some(EnginePayload::ChannelStats(cockatiel_client::proto::ChannelStats {
             platform: platform.to_string(),
             channel: channel.to_string(),
-            viewers: viewers as i64,
+            viewers: viewers,
             is_live,
             title: title.to_string(),
             updated_at: now_unix_millis(),
