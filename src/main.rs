@@ -790,6 +790,137 @@ fn spawn_stream_monitor(
     });
 }
 
+/// Kick's official public API endpoint for updating channel/livestream
+/// metadata. Requires a USER token with the `channel:write` scope — an app
+/// (client-credentials) token is rejected by Kick.
+const KICK_CHANNELS_URL: &str = "https://api.kick.com/public/v1/channels";
+
+/// Apply the stream control to the operator's own Kick channel. Kick exposes a
+/// title update (`PATCH /public/v1/channels` with `stream_title`) but NO
+/// schedule or thumbnail API, so only the title is applied. Best-effort: a
+/// failure (e.g. an app token without `channel:write`) is returned verbatim so
+/// the operator sees exactly what Kick said.
+async fn apply_kick_stream_control(
+    client: &reqwest::Client,
+    oauth_token: &str,
+    control: &serde_json::Value,
+) -> Result<String, String> {
+    let title = control.get("title").and_then(|v| v.as_str()).unwrap_or("");
+    let scheduled_start_ms = control
+        .get("scheduled_start_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if oauth_token.is_empty() {
+        return Err("no Kick token — set KICK_OAUTH_TOKEN to a user token with channel:write".to_string());
+    }
+    if title.is_empty() {
+        // Kick has no schedule API; report it rather than silently dropping it.
+        return Ok(if scheduled_start_ms != 0 {
+            "kick supports title only (no schedule API)".to_string()
+        } else {
+            "nothing to apply".to_string()
+        });
+    }
+    let res = client
+        .patch(KICK_CHANNELS_URL)
+        .header("Authorization", format!("Bearer {oauth_token}"))
+        .header("Content-Type", "application/json")
+        .json(&json!({ "stream_title": title }))
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+        .map_err(|e| format!("channels update failed: {e}"))?;
+    if !res.status().is_success() {
+        let s = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(format!("channels update {s}: {text}"));
+    }
+    Ok("set title".to_string())
+}
+
+/// Poll the engine's `stream_schedule` and apply each new revision's title to
+/// the operator's Kick channel, reporting the result via `stream_control_status`
+/// (platform `kick`). Reads the current token from `shared_token` at apply time
+/// so a token rotation is honored.
+async fn kick_stream_control_task(
+    token: Arc<tokio::sync::Mutex<String>>,
+    poll_interval_secs: u32,
+    http_client: reqwest::Client,
+    write_ws: Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: Arc<tokio::sync::Mutex<EngineIdentity>>,
+    mut schedule_rx: mpsc::Receiver<serde_json::Value>,
+) {
+    let mut interval = tokio::time::interval(Duration::from_secs(poll_interval_secs.max(5) as u64));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval.tick().await; // burn the immediate first tick
+    let mut last_applied = 0u64;
+    loop {
+        interval.tick().await;
+        let (auth, module, instance) = {
+            let id = identity.lock().await;
+            (id.auth.clone(), id.module.clone(), id.instance.clone())
+        };
+        let query = ContainerForEngine {
+            version: 2,
+            auth_token: auth.clone(),
+            module_name: module.clone(),
+            module_instance_uuid7: instance.clone(),
+            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                query_id: "stream_schedule".to_string(),
+                sql: "{}".to_string(),
+                params: vec![],
+            })),
+        };
+        let mut qbuf = Vec::new();
+        if query.encode(&mut qbuf).is_err() {
+            continue;
+        }
+        {
+            let mut w = write_ws.lock().await;
+            if w.send(WsMessage::Binary(qbuf.into())).await.is_err() {
+                continue;
+            }
+        }
+        let control = match tokio::time::timeout(Duration::from_secs(10), schedule_rx.recv()).await {
+            Ok(Some(v)) => v,
+            _ => continue,
+        };
+        let revision = control.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+        if revision == 0 || revision == last_applied {
+            continue;
+        }
+        let token_now = token.lock().await.clone();
+        let (ok, message) = match apply_kick_stream_control(&http_client, &token_now, &control).await {
+            Ok(m) => (true, m),
+            Err(e) => (false, e),
+        };
+        last_applied = revision;
+        info!("[stream-control] rev {} applied={} — {}", revision, ok, message);
+        let status = json!({
+            "platform": "kick",
+            "revision": revision,
+            "ok": ok,
+            "message": message,
+        });
+        let report = ContainerForEngine {
+            version: 2,
+            auth_token: auth,
+            module_name: module,
+            module_instance_uuid7: instance,
+            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
+                query_id: "stream_control_status".to_string(),
+                sql: status.to_string(),
+                params: vec![],
+            })),
+        };
+        let mut rbuf = Vec::new();
+        if report.encode(&mut rbuf).is_ok() {
+            let mut w = write_ws.lock().await;
+            let _ = w.send(WsMessage::Binary(rbuf.into())).await;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let subscriber = FmtSubscriber::builder()
@@ -892,6 +1023,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // them indefinitely — at most 64 messages sit in the queue.
     let (outbound_tx, outbound_rx) = mpsc::channel::<String>(adapter_config.outbound_queue_cap);
     let outbound_tx_task = outbound_tx.clone();
+
+    // Stream-manager wiring: the read loop forwards `stream_schedule` poll
+    // results into this channel; the stream-control task (spawned after setup)
+    // awaits them, applies the title to the Kick channel and reports back.
+    let (schedule_tx, schedule_rx) = mpsc::channel::<serde_json::Value>(8);
     let client_worker = client_clone.clone();
     let token_worker = token_for_task.clone();
     tokio::spawn(async move {
@@ -921,7 +1057,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 let id = identity_task.lock().await;
                                 (id.auth.clone(), id.instance.clone(), id.module.clone())
                             };
-                            info!("Received from engine: {:?}", container.payload.as_ref().map(|p| std::mem::discriminant(p)));
 
                             if let Some(ModulePayload::AuthVerify(_)) = container.payload {
                                 // Answer the engine's liveness probe with our auth
@@ -1034,6 +1169,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     if ack.encode(&mut abuf).is_ok() {
                                         let mut w = write_task.lock().await;
                                         let _ = w.send(WsMessage::Binary(abuf)).await;
+                                    }
+                                }
+                            } else if let Some(ModulePayload::DatabaseQueryResult(res)) = container.payload {
+                                // A `stream_schedule` poll result: forward it to
+                                // the stream-control task, which owns the apply.
+                                if res.query_id == "stream_schedule" {
+                                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&res.result_blob) {
+                                        let _ = schedule_tx.try_send(v);
                                     }
                                 }
                             }
@@ -1384,6 +1527,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             write_ws_cockatiel.clone(),
             identity.clone(),
         );
+
+        // Stream manager: apply the operator's title to the Kick channel. Kick
+        // has no schedule/thumbnail API, so only the title is applied.
+        tokio::spawn(kick_stream_control_task(
+            shared_token.clone(),
+            adapter_config.stream_poll_interval_secs,
+            http_client.clone(),
+            write_ws_cockatiel.clone(),
+            identity.clone(),
+            schedule_rx,
+        ));
     }
 
     // Surface the setup summary to the operator (the accumulated log).
@@ -1614,6 +1768,26 @@ mod tests {
     fn stream_start_message_defaults_title_to_empty() {
         let msg = stream_start_message("vulbyte", "2026-09-24T10:00:00.000Z", "");
         assert!(msg.ends_with("— title: \"\""));
+    }
+
+    #[tokio::test]
+    async fn kick_stream_control_handles_empty_token_and_title_only() {
+        let client = reqwest::Client::new();
+        // No token → a clear error (nothing is sent).
+        let err = apply_kick_stream_control(&client, "", &json!({ "title": "x" }))
+            .await
+            .unwrap_err();
+        assert!(err.contains("no Kick token"), "got: {err}");
+
+        // A schedule with no title → Kick has no schedule API; reported, not sent.
+        let msg = apply_kick_stream_control(&client, "tok", &json!({ "scheduled_start_ms": 1_700_000_000_000i64 }))
+            .await
+            .unwrap();
+        assert!(msg.contains("title only"), "got: {msg}");
+
+        // Nothing set → nothing to apply.
+        let msg = apply_kick_stream_control(&client, "tok", &json!({})).await.unwrap();
+        assert_eq!(msg, "nothing to apply");
     }
 
     #[test]
