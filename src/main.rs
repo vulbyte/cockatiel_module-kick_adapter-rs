@@ -1567,6 +1567,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pusher_url = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.6.0&flash=false";
 
+    // Consecutive connect/read failures, for exponential reconnect backoff.
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         info!("Connecting to Kick Pusher WebSocket...");
 
@@ -1632,6 +1635,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                 } else if event == "pusher_internal:subscription_succeeded" {
                                     info!("Successfully subscribed to Kick chatroom: chatrooms.{}.v2", chatroom_id);
+                                    consecutive_failures = 0;
+                                } else if event == "pusher:error" {
+                                    // The server rejected the connection at the app/protocol
+                                    // level (bad key/cluster) and is about to close it.
+                                    // Without this branch it was invisible: the socket just
+                                    // closed and the adapter looped with no explanation.
+                                    let code = parsed
+                                        .get("data")
+                                        .and_then(|d| d.get("code"))
+                                        .and_then(|c| c.as_i64())
+                                        .unwrap_or(0);
+                                    let message = parsed
+                                        .get("data")
+                                        .and_then(|d| d.get("message"))
+                                        .and_then(|m| m.as_str())
+                                        .unwrap_or("");
+                                    error!("Kick realtime rejected the connection (code {}): {}", code, message);
+                                    if code == 4001
+                                        || message.contains("cluster")
+                                        || message.contains("App key")
+                                    {
+                                        error!(
+                                            "Kick changed its realtime configuration: the Pusher \
+                                             app key/cluster this adapter uses is no longer valid, \
+                                             so live chat cannot connect. Kick now negotiates its \
+                                             realtime endpoint at runtime; update the adapter's \
+                                             realtime endpoint/key."
+                                        );
+                                    }
+                                    break;
                                 } else if event == "App\\Events\\ChatMessageEvent" {
                                     if let Some(data_str) = parsed.get("data").and_then(|d| d.as_str()) {
                                         if let Ok(data_json) = serde_json::from_str::<serde_json::Value>(data_str) {
@@ -1707,10 +1740,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(
-            adapter_config.pusher_reconnect_delay_secs as u64,
-        ))
-        .await;
+        consecutive_failures = consecutive_failures.saturating_add(1);
+        // Exponential backoff so a persistent rejection (e.g. Kick changing its
+        // realtime config) does not hammer the endpoint every few seconds.
+        let backoff_secs = (adapter_config.pusher_reconnect_delay_secs as u64)
+            .saturating_mul(1u64 << consecutive_failures.saturating_sub(1).min(6))
+            .min(60);
+        if consecutive_failures > 1 {
+            warn!(
+                "Kick realtime reconnect attempt {} — backing off {}s.",
+                consecutive_failures, backoff_secs
+            );
+        }
+        tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
         }
     }
 }
