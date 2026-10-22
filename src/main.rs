@@ -96,6 +96,10 @@ struct KickAdapterConfig {
     pusher_reconnect_delay_secs: u32,
     ws_retry_delay_secs: u32,
     prompt_timeout_secs: u32,
+    /// Base URL for Kick's web API that negotiates the realtime (Centrifugo)
+    /// endpoint + token. Overridable for region/proxy changes.
+    #[serde(default = "default_realtime_base_url")]
+    realtime_base_url: String,
     /// How often (seconds) the adapter polls Kick's channel API for live status.
     #[serde(default = "default_stream_poll_interval_secs")]
     stream_poll_interval_secs: u32,
@@ -104,6 +108,11 @@ struct KickAdapterConfig {
 /// Default interval (seconds) between Kick live-status polls.
 fn default_stream_poll_interval_secs() -> u32 {
     30
+}
+
+/// Default Kick web API base URL (realtime negotiation/auth live here).
+fn default_realtime_base_url() -> String {
+    "https://web.kick.com".to_string()
 }
 
 impl Default for KickAdapterConfig {
@@ -124,6 +133,7 @@ impl Default for KickAdapterConfig {
             pusher_reconnect_delay_secs: 5,
             ws_retry_delay_secs: 5,
             prompt_timeout_secs: 300,
+            realtime_base_url: default_realtime_base_url(),
             stream_poll_interval_secs: 30,
         }
     }
@@ -209,6 +219,9 @@ fn backfill_adapter_config_defaults() {
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
     let before = ms.clone();
+    if ms.get("realtime_base_url").is_none() {
+        ms["realtime_base_url"] = serde_json::json!(default_realtime_base_url());
+    }
     let defaults: [(&str, i32); 12] = [
         ("default_timeout_secs", 300),
         ("http_timeout_secs", 15),
@@ -287,6 +300,9 @@ fn load_adapter_config() -> Option<KickAdapterConfig> {
         .and_then(|c| c.as_str().map(|s| s.to_string()))
         .unwrap_or_else(|| std::env::var("KICK_CHANNEL_NAME").unwrap_or_default());
     let mut cfg: KickAdapterConfig = serde_json::from_value(saved).unwrap_or_default();
+    if cfg.realtime_base_url.trim().is_empty() {
+        cfg.realtime_base_url = default_realtime_base_url();
+    }
     cfg.channel_name = Some(channel_name);
     cfg.client_id = Some(std::env::var("KICK_CLIENT_ID").unwrap_or_default());
     cfg.client_secret = Some(std::env::var("KICK_CLIENT_SECRET").unwrap_or_default());
@@ -475,10 +491,14 @@ async fn prompt_for_input(
     None
 }
 
+/// Resolve a Kick channel name to its `(chatroom_id, channel_id)`. The realtime
+/// (Centrifugo) subscriptions need BOTH: `chatroom_<id>` / `chatrooms.<id>` use
+/// the chatroom id, while `channel_<id>` uses the channel id. The channel id is
+/// the top-level `id` (with `chatroom.channel_id` as a fallback).
 async fn fetch_chatroom_id(
     client: &reqwest::Client,
     name: &str,
-) -> Result<u64, Box<dyn std::error::Error>> {
+) -> Result<(u64, u64), Box<dyn std::error::Error>> {
     let clean_name = name.trim().strip_prefix('@').unwrap_or(name.trim());
     let url = format!("https://kick.com/api/v2/channels/{}", clean_name);
 
@@ -495,7 +515,12 @@ async fn fetch_chatroom_id(
 
     if let Some(chatroom) = res.get("chatroom") {
         if let Some(id) = chatroom.get("id").and_then(|i| i.as_u64()) {
-            return Ok(id);
+            let channel_id = res
+                .get("id")
+                .and_then(|i| i.as_u64())
+                .or_else(|| chatroom.get("channel_id").and_then(|i| i.as_u64()))
+                .unwrap_or(0);
+            return Ok((id, channel_id));
         }
     }
 
@@ -534,6 +559,355 @@ async fn fetch_app_access_token(
     }
 
     Err("Invalid response structure from Kick OAuth server".into())
+}
+
+/// Browser-like UA — Kick's web API rejects requests without one.
+const KICK_WEB_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36";
+
+/// Body posted to `/realtime/connection` and the channel "accept" endpoint:
+/// declares the client id + which realtime providers we support. Kick picks
+/// Centrifugo and returns its regional WebSocket URL in the response.
+fn realtime_client_body(client_id: &str) -> serde_json::Value {
+    json!({
+        "client": { "id": client_id, "type": "web" },
+        "capabilities": {
+            "accepted_providers": [
+                { "provider": "pusher" },
+                { "provider": "centrifugo" }
+            ]
+        }
+    })
+}
+
+/// Step 2: negotiate the realtime provider and return its WebSocket URL
+/// (`data.connections[0].credentials.url`) — never hardcode the region.
+async fn fetch_realtime_ws_url(
+    client: &reqwest::Client,
+    base_url: &str,
+    client_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/api/v1/realtime/connection",
+        base_url.trim_end_matches('/')
+    );
+    let res = client
+        .post(&url)
+        .header("User-Agent", KICK_WEB_UA)
+        .json(&realtime_client_body(client_id))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Kick realtime connection failed: {}", err_text).into());
+    }
+    let json_res: serde_json::Value = res.json().await?;
+    json_res
+        .get("data")
+        .and_then(|d| d.get("connections"))
+        .and_then(|c| c.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|c| c.get("credentials"))
+        .and_then(|c| c.get("url"))
+        .and_then(|u| u.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Kick realtime response had no connection URL".into())
+}
+
+/// Step 3: fetch the Centrifugo connect JWT (`data.token`).
+async fn fetch_realtime_token(
+    client: &reqwest::Client,
+    base_url: &str,
+    client_id: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/api/v1/realtime/auth/connection",
+        base_url.trim_end_matches('/')
+    );
+    let res = client
+        .post(&url)
+        .header("User-Agent", KICK_WEB_UA)
+        .json(&json!({ "client_id": client_id }))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Kick realtime auth failed: {}", err_text).into());
+    }
+    let json_res: serde_json::Value = res.json().await?;
+    json_res
+        .get("data")
+        .and_then(|d| d.get("token"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "Kick realtime auth response had no token".into())
+}
+
+/// Step 4: "accept" the chat connection for this chatroom BEFORE subscribing.
+async fn accept_realtime_chat(
+    client: &reqwest::Client,
+    base_url: &str,
+    chatroom_id: u64,
+    client_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let url = format!(
+        "{}/api/v1/realtime/channels/{}/chat/connection",
+        base_url.trim_end_matches('/'),
+        chatroom_id
+    );
+    let res = client
+        .post(&url)
+        .header("User-Agent", KICK_WEB_UA)
+        .json(&realtime_client_body(client_id))
+        .send()
+        .await?;
+    if !res.status().is_success() {
+        let err_text = res.text().await.unwrap_or_default();
+        return Err(format!("Kick chat connection accept failed: {}", err_text).into());
+    }
+    Ok(())
+}
+
+/// Kick wraps a chat payload either directly, or as a JSON-encoded string in a
+/// `data` field. Unwrap to the inner message object when it looks like one.
+fn normalize_chat_payload(value: serde_json::Value) -> serde_json::Value {
+    if let Some(inner) = value.get("data") {
+        let parsed = match inner {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok(),
+            serde_json::Value::Object(_) => Some(inner.clone()),
+            _ => None,
+        };
+        if let Some(p) = parsed {
+            if p.get("sender").is_some() || p.get("content").is_some() {
+                return p;
+            }
+        }
+    }
+    value
+}
+
+/// A `push` frame's chat message as `(sender, content, raw_payload)`, or None
+/// if it isn't a chat message (no sender/content).
+fn extract_chat_from_push(push: &serde_json::Value) -> Option<(String, String, serde_json::Value)> {
+    let data = push.get("pub")?.get("data")?;
+    let data_json = match data {
+        serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).ok()?,
+        other => other.clone(),
+    };
+    let data_json = normalize_chat_payload(data_json);
+    let sender = data_json
+        .get("sender")
+        .and_then(|s| {
+            s.get("username")
+                .or_else(|| s.get("slug"))
+                .and_then(|v| v.as_str())
+        })
+        .or_else(|| data_json.get("username").and_then(|v| v.as_str()))
+        .unwrap_or("Unknown");
+    let content = data_json
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+    if content.is_empty() {
+        return None;
+    }
+    Some((
+        sender.to_string(),
+        content.to_string(),
+        data_json,
+    ))
+}
+
+/// Forward one Kick chat message to the engine on the SAME
+/// `MessagePreProcess` path the old Pusher loop used. Reads the CURRENT session
+/// identity so a reconnect never leaves stale credentials behind.
+async fn send_chat_to_engine(
+    write_ws: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    channel_name: &str,
+    sender: &str,
+    content: &str,
+    raw_payload: &serde_json::Value,
+) {
+    let pre_process = MessagePreProcess {
+        audio: vec![],
+        audio_type: String::new(),
+        message_uuid7: String::new(),
+        raw_message: Some(ChatMessage {
+            platform: "kick".into(),
+            raw_data: raw_payload.to_string().as_bytes().to_vec(),
+            raw_message: content.to_string(),
+            user_uuid7: sender.to_string(),
+            command: None,
+            channel_id: channel_name.to_string(),
+            user_data: None,
+        }),
+    };
+    let (auth, instance, module) = {
+        let id = identity.lock().await;
+        (id.auth.clone(), id.instance.clone(), id.module.clone())
+    };
+    let container = cockatiel_client::proto::ContainerForEngine {
+        version: 2,
+        auth_token: auth,
+        module_name: module,
+        module_instance_uuid7: instance,
+        payload: Some(EnginePayload::MessagePreProcess(pre_process)),
+    };
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        if let Err(e) = write_ws.lock().await.send(WsMessage::Binary(buf)).await {
+            error!("Failed to send message to engine: {}", e);
+        }
+    }
+}
+
+/// One Centrifugo session: negotiate URL/token, accept the chat, connect and
+/// subscribe, then read until the socket drops. Returns `Err` on any failure so
+/// the caller applies its exponential reconnect backoff.
+#[allow(clippy::too_many_arguments)]
+async fn run_centrifugo_session(
+    http_client: &reqwest::Client,
+    base_url: &str,
+    channel_name: &str,
+    channel_id: u64,
+    chatroom_id: u64,
+    keepalive_secs: u64,
+    write_ws_cockatiel: &Arc<tokio::sync::Mutex<WsWriteHalf>>,
+    identity: &Arc<tokio::sync::Mutex<EngineIdentity>>,
+    consecutive_failures: &mut u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Steps 1-4: negotiate a fresh client id, WS URL and connect token, and
+    // "accept" the chatroom. Done per attempt so a reconnect always uses a
+    // fresh, unexpired credentials set.
+    let client_id = uuid::Uuid::new_v4().to_string();
+    let ws_url = fetch_realtime_ws_url(http_client, base_url, &client_id).await?;
+    let token = fetch_realtime_token(http_client, base_url, &client_id).await?;
+    accept_realtime_chat(http_client, base_url, chatroom_id, &client_id).await?;
+    info!("Connecting to Kick Centrifugo WebSocket: {}", ws_url);
+
+    // Step 5: open the WS and send the `connect` frame.
+    let mut req = ws_url.into_client_request()?;
+    let headers = req.headers_mut();
+    headers.insert("Origin", "https://kick.com".parse().unwrap());
+    headers.insert("User-Agent", KICK_WEB_UA.parse().unwrap());
+
+    let (mut ws_stream, _) = connect_async(req).await?;
+    info!("Connected to Kick Centrifugo layer!");
+
+    let connect_frame = json!({ "connect": { "token": token, "name": "js" }, "id": 1 });
+    ws_stream
+        .send(WsMessage::Text(connect_frame.to_string()))
+        .await?;
+
+    // Step 6: subscribe to every channel Kick's web client uses. `next_id`
+    // increments for each subscribe (the connect used id 1).
+    let subscriptions = [
+        format!("channel_{}", channel_id),
+        format!("chatroom_{}", chatroom_id),
+        format!("chatrooms.{}", chatroom_id),
+        format!("chatrooms.{}.v2", chatroom_id),
+    ];
+    let mut next_id: u64 = 2;
+    let mut connect_seen = false;
+    let mut sub_acks: u32 = 0;
+
+    let idle = Duration::from_secs(keepalive_secs.max(5));
+    let mut next_keepalive = tokio::time::Instant::now() + idle;
+
+    loop {
+        tokio::select! {
+            // Idle keepalive: only fires if the server stopped pinging; the
+            // healthy server pings every ~25s and resets this deadline. (An
+            // UNSOLICITED `{}` while the connection is healthy is rejected by
+            // the server with 3501, so we never send one proactively.)
+            _ = tokio::time::sleep_until(next_keepalive) => {
+                let _ = ws_stream.send(WsMessage::Text("{}".into())).await;
+                next_keepalive = tokio::time::Instant::now() + idle;
+            }
+            msg = ws_stream.next() => {
+                match msg {
+                    Some(Ok(WsMessage::Text(text))) => {
+                        next_keepalive = tokio::time::Instant::now() + idle;
+                        // Centrifugo batches multiple JSON commands into ONE
+                        // text frame, newline-delimited — parse each line.
+                        for line in text.split('\n') {
+                            let line = line.trim();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let parsed: serde_json::Value = match serde_json::from_str(line) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    warn!("Unparseable Kick realtime frame: {} ({})", line, e);
+                                    continue;
+                                }
+                            };
+
+                            // Server ping: an empty object — reply in kind.
+                            if parsed.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                                let _ = ws_stream.send(WsMessage::Text("{}".into())).await;
+                            } else if parsed.get("connect").is_some() || parsed.get("id") == Some(&json!(1)) {
+                                info!("Centrifugo connect ack: {}", parsed);
+                                if !connect_seen {
+                                    connect_seen = true;
+                                    for channel in &subscriptions {
+                                        let sub = json!({
+                                            "subscribe": { "channel": channel, "flag": 1 },
+                                            "id": next_id,
+                                        });
+                                        if let Err(e) = ws_stream.send(WsMessage::Text(sub.to_string())).await {
+                                            error!("Failed to send subscription frame: {}", e);
+                                            return Err(e.into());
+                                        }
+                                        next_id += 1;
+                                    }
+                                }
+                            } else if parsed.get("subscribe").is_some() {
+                                sub_acks += 1;
+                                info!("Centrifugo subscribe ack {}/{}: {}", sub_acks, subscriptions.len(), parsed);
+                                if sub_acks as usize >= subscriptions.len() {
+                                    info!("Successfully subscribed to Kick chatroom {}", chatroom_id);
+                                    *consecutive_failures = 0;
+                                }
+                            } else if let Some(push) = parsed.get("push") {
+                                if let Some((sender, content, raw)) = extract_chat_from_push(push) {
+                                    info!("[Kick Chat] {}: {}", sender, content);
+                                    send_chat_to_engine(
+                                        write_ws_cockatiel,
+                                        identity,
+                                        channel_name,
+                                        &sender,
+                                        &content,
+                                        &raw,
+                                    )
+                                    .await;
+                                }
+                            } else if let Some(err) = parsed.get("error") {
+                                error!("Kick realtime error frame: {}", err);
+                            }
+                        }
+                    }
+                    Some(Ok(WsMessage::Ping(p))) => {
+                        let _ = ws_stream.send(WsMessage::Pong(p)).await;
+                    }
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        error!("Kick Centrifugo connection closed: {:?}. Reconnecting...", frame);
+                        return Err("Kick Centrifugo connection closed".into());
+                    }
+                    Some(Err(e)) => {
+                        error!("Kick realtime WebSocket error: {}. Reconnecting...", e);
+                        return Err(e.into());
+                    }
+                    None => {
+                        error!("Kick Centrifugo connection closed. Reconnecting...");
+                        return Err("Kick Centrifugo connection ended".into());
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
 }
 
 async fn send_kick_message(
@@ -1410,11 +1784,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // unresolvable outcome logs a clear error and retries with capped backoff.
     let mut setup_log = String::new();
     let mut resolve_backoff = adapter_config.chatroom_resolve_base_secs;
-    let chatroom_id = loop {
+    let (chatroom_id, channel_id) = loop {
         match fetch_chatroom_id(&http_client, &channel_name).await {
-            Ok(id) if id > 0 => {
-                info!("Successfully resolved chatroom ID: {}", id);
-                break id;
+            Ok((id, cid)) if id > 0 => {
+                info!(
+                    "Successfully resolved chatroom ID: {} (channel ID: {})",
+                    id, cid
+                );
+                break (id, cid);
             }
             Ok(_) => {
                 error!(
@@ -1565,179 +1942,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let pusher_url = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.6.0&flash=false";
-
     // Consecutive connect/read failures, for exponential reconnect backoff.
     let mut consecutive_failures: u32 = 0;
+    let realtime_base_url = adapter_config.realtime_base_url.clone();
+    let realtime_ping_secs = adapter_config.pusher_ping_interval_secs as u64;
 
+    // Realtime read loop (Centrifugo). Each iteration negotiates a fresh
+    // client id / WS URL / token, accepts the chatroom, subscribes, and reads
+    // until the socket drops; failures feed the exponential backoff below.
     loop {
-        info!("Connecting to Kick Pusher WebSocket...");
-
-        let mut req = match pusher_url.into_client_request() {
-            Ok(r) => r,
-            Err(e) => {
-                error!("Failed to build WebSocket request: {}", e);
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    adapter_config.ws_retry_delay_secs as u64,
-                ))
-                .await;
-                continue;
-            }
-        };
-
-        let headers = req.headers_mut();
-        headers.insert("Origin", "https://kick.com".parse().unwrap());
-        headers.insert("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36".parse().unwrap());
-
-        let (mut ws_stream, _) = match connect_async(req).await {
-            Ok(conn) => conn,
-            Err(e) => {
-                error!(
-                    "Failed to connect to Kick WebSocket: {}. Retrying in {} seconds...",
-                    e,
-                    adapter_config.ws_retry_delay_secs
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(
-                    adapter_config.ws_retry_delay_secs as u64,
-                ))
-                .await;
-                continue;
-            }
-        };
-
-        info!("Connected to Kick WebSocket layer!");
-
-        let mut ping_interval = tokio::time::interval(tokio::time::Duration::from_secs(
-            adapter_config.pusher_ping_interval_secs as u64,
-        ));
-
-        loop {
-            tokio::select! {
-                _ = ping_interval.tick() => {}
-                msg = ws_stream.next() => {
-                    match msg {
-                        Some(Ok(WsMessage::Text(text))) => {
-                            if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
-                                let event = parsed.get("event").and_then(|e| e.as_str()).unwrap_or("");
-
-                                if event == "pusher:connection_established" {
-                                    info!("Pusher handshake established. Subscribing to chatroom {}...", chatroom_id);
-                                    let subscribe_msg = json!({
-                                        "event": "pusher:subscribe",
-                                        "data": {
-                                            "auth": "",
-                                            "channel": format!("chatrooms.{}.v2", chatroom_id)
-                                        }
-                                    });
-                                    if let Err(e) = ws_stream.send(WsMessage::Text(subscribe_msg.to_string())).await {
-                                        error!("Failed to send subscription frame: {}", e);
-                                        break;
-                                    }
-                                } else if event == "pusher_internal:subscription_succeeded" {
-                                    info!("Successfully subscribed to Kick chatroom: chatrooms.{}.v2", chatroom_id);
-                                    consecutive_failures = 0;
-                                } else if event == "pusher:error" {
-                                    // The server rejected the connection at the app/protocol
-                                    // level (bad key/cluster) and is about to close it.
-                                    // Without this branch it was invisible: the socket just
-                                    // closed and the adapter looped with no explanation.
-                                    let code = parsed
-                                        .get("data")
-                                        .and_then(|d| d.get("code"))
-                                        .and_then(|c| c.as_i64())
-                                        .unwrap_or(0);
-                                    let message = parsed
-                                        .get("data")
-                                        .and_then(|d| d.get("message"))
-                                        .and_then(|m| m.as_str())
-                                        .unwrap_or("");
-                                    error!("Kick realtime rejected the connection (code {}): {}", code, message);
-                                    if code == 4001
-                                        || message.contains("cluster")
-                                        || message.contains("App key")
-                                    {
-                                        error!(
-                                            "Kick changed its realtime configuration: the Pusher \
-                                             app key/cluster this adapter uses is no longer valid, \
-                                             so live chat cannot connect. Kick now negotiates its \
-                                             realtime endpoint at runtime; update the adapter's \
-                                             realtime endpoint/key."
-                                        );
-                                    }
-                                    break;
-                                } else if event == "App\\Events\\ChatMessageEvent" {
-                                    if let Some(data_str) = parsed.get("data").and_then(|d| d.as_str()) {
-                                        if let Ok(data_json) = serde_json::from_str::<serde_json::Value>(data_str) {
-                                            let sender = data_json.get("sender")
-                                                .and_then(|s| s.get("username"))
-                                                .and_then(|u| u.as_str())
-                                                .unwrap_or("Unknown");
-
-                                            let content = data_json.get("content")
-                                                .and_then(|c| c.as_str())
-                                                .unwrap_or("");
-
-                                            if !content.is_empty() {
-                                                info!("[Kick Chat] {}: {}", sender, content);
-                                                let pre_process = MessagePreProcess {
-                        audio: vec![],
-                        audio_type: String::new(),
-                                                    message_uuid7: String::new(),
-                                                    raw_message: Some(ChatMessage {
-                                                        platform: "kick".into(),
-                                                        raw_data: data_json.to_string().as_bytes().to_vec(),
-                                                        raw_message: content.to_string(),
-                                                        user_uuid7: sender.to_string(),
-                                                        command: None,
-                                                        channel_id: channel_name.clone(),
-                                                        user_data: None,
-                                                    }),
-                                                };
-                                                // Use the CURRENT session identity (a
-                                                // reconnect swaps it) for every engine
-                                                // send, not stale setup-phase clones.
-                                                let (auth, instance, module) = {
-                                                    let id = identity.lock().await;
-                                                    (id.auth.clone(), id.instance.clone(), id.module.clone())
-                                                };
-                                                let container = cockatiel_client::proto::ContainerForEngine {
-                                                    version: 2,
-                                                    auth_token: auth,
-                                                    module_name: module,
-                                                    module_instance_uuid7: instance,
-                                                    payload: Some(EnginePayload::MessagePreProcess(pre_process)),
-                                                };
-                                                let mut buf = Vec::new();
-                                                use prost::Message;
-                                                if container.encode(&mut buf).is_ok() {
-                                                    if let Err(e) = write_ws_cockatiel.lock().await.send(WsMessage::Binary(buf.into())).await {
-                                                        error!("Failed to send message to engine: {}", e);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else if event == "pusher:ping" {
-                                    let pong = json!({ "event": "pusher:pong", "data": {} });
-                                    let _ = ws_stream.send(WsMessage::Text(pong.to_string())).await;
-                                }
-                            }
-                        }
-                        Some(Ok(WsMessage::Ping(p))) => {
-                            let _ = ws_stream.send(WsMessage::Pong(p)).await;
-                        }
-                        Some(Err(e)) => {
-                            error!("WebSocket error: {}. Reconnecting...", e);
-                            break;
-                        }
-                        None => {
-                            error!("WebSocket connection closed. Reconnecting...");
-                            break;
-                        }
-                        _ => {}
-                    }
-                }
-            }
+        if let Err(err) = run_centrifugo_session(
+            &http_client,
+            &realtime_base_url,
+            &channel_name,
+            channel_id,
+            chatroom_id,
+            realtime_ping_secs,
+            &write_ws_cockatiel,
+            &identity,
+            &mut consecutive_failures,
+        )
+        .await
+        {
+            error!("Kick realtime session ended: {}", err);
         }
 
         consecutive_failures = consecutive_failures.saturating_add(1);
@@ -1753,7 +1980,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
-        }
+    }
     }
 }
 
@@ -1899,5 +2126,91 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn realtime_client_body_declares_centrifugo_capability() {
+        let body = realtime_client_body("abc");
+        assert_eq!(body["client"]["id"], "abc");
+        assert_eq!(body["client"]["type"], "web");
+        let providers = body["capabilities"]["accepted_providers"].as_array().unwrap();
+        assert!(providers.iter().any(|p| p["provider"] == "centrifugo"));
+        assert!(providers.iter().any(|p| p["provider"] == "pusher"));
+    }
+
+    #[test]
+    fn extract_chat_from_inline_push_object() {
+        let push = json!({
+            "channel": "chatrooms.1523135.v2",
+            "pub": { "data": {
+                "content": "hello world",
+                "sender": { "username": "alice", "slug": "alice-slug" }
+            }, "offset": 7 }
+        });
+        let (sender, content, raw) = extract_chat_from_push(&push).unwrap();
+        assert_eq!(sender, "alice");
+        assert_eq!(content, "hello world");
+        assert_eq!(raw["content"], "hello world");
+    }
+
+    #[test]
+    fn extract_chat_from_json_encoded_string_push() {
+        let inner = json!({
+            "content": "encoded",
+            "sender": { "slug": "bob-slug" }
+        });
+        let push = json!({
+            "channel": "chatroom_1523135",
+            "pub": { "data": inner.to_string() }
+        });
+        let (sender, content, _) = extract_chat_from_push(&push).unwrap();
+        assert_eq!(sender, "bob-slug");
+        assert_eq!(content, "encoded");
+    }
+
+    #[test]
+    fn extract_chat_sender_falls_back_to_top_level_username() {
+        let push = json!({
+            "pub": { "data": { "content": "hi", "username": "carol" } }
+        });
+        let (sender, content, _) = extract_chat_from_push(&push).unwrap();
+        assert_eq!(sender, "carol");
+        assert_eq!(content, "hi");
+    }
+
+    #[test]
+    fn extract_chat_ignores_pushes_without_content() {
+        let push = json!({ "pub": { "data": { "sender": { "username": "x" } } } });
+        assert!(extract_chat_from_push(&push).is_none());
+        assert!(extract_chat_from_push(&json!({ "pub": {} })).is_none());
+        assert!(extract_chat_from_push(&json!({})).is_none());
+    }
+
+    #[test]
+    fn default_realtime_base_url_is_kick_web() {
+        assert_eq!(default_realtime_base_url(), "https://web.kick.com");
+        assert_eq!(KickAdapterConfig::default().realtime_base_url, "https://web.kick.com");
+    }
+
+    /// The exact Centrifugo push shape captured live from Kick (2026-10-22):
+    /// `pub.data` is an envelope `{event, data:"<json string>"}` and the chat
+    /// message lives in the nested `data` string.
+    #[test]
+    fn extracts_live_centrifugo_push() {
+        let inner = r#"{"id":"23cd27de-db82","chatroom_id":668,"content":"oh man he was at the light","type":"message","sender":{"id":925120,"username":"Wubbers","slug":"wubbers"}}"#;
+        let frame = json!({
+            "push": {
+                "channel": "chatrooms.668.v2",
+                "pub": {
+                    "data": { "event": "App\\Events\\ChatMessageEvent", "data": inner },
+                    "offset": 42
+                }
+            }
+        });
+        // The caller extracts the `push` object from the frame first.
+        let push = frame.get("push").unwrap();
+        let (sender, content, _) = extract_chat_from_push(push).unwrap();
+        assert_eq!(sender, "Wubbers");
+        assert_eq!(content, "oh man he was at the light");
     }
 }
